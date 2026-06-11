@@ -2,6 +2,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
+from openai import BadRequestError
+from pydantic import BaseModel
 
 from src.llm.backends.openai import OpenAIBackend
 
@@ -225,6 +227,58 @@ async def test_openai_backend_skips_extra_body_when_thinking_budget_zero() -> No
         raise AssertionError("Expected OpenAI create call")
     call = await_args.kwargs
     assert "extra_body" not in call
+
+
+@pytest.mark.asyncio
+async def test_openai_structured_response_falls_back_when_json_schema_rejected() -> None:
+    class StructuredAnswer(BaseModel):
+        answer: str
+
+    rejected = BadRequestError(
+        "json_schema rejected",
+        response=Mock(status_code=400, headers={}, request=Mock()),
+        body=None,
+    )
+    fallback_response = SimpleNamespace(
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content='{"answer":"ok"}',
+                    tool_calls=[],
+                    reasoning_details=[],
+                ),
+            )
+        ],
+        usage=SimpleNamespace(
+            prompt_tokens=10,
+            completion_tokens=5,
+            prompt_tokens_details=None,
+        ),
+    )
+    client = Mock()
+    client.chat.completions.parse = AsyncMock(side_effect=rejected)
+    client.chat.completions.create = AsyncMock(
+        side_effect=[rejected, fallback_response]
+    )
+
+    backend = OpenAIBackend(client)
+    result = await backend.complete(
+        model="local-qwen",
+        messages=[{"role": "user", "content": "Hello"}],
+        max_tokens=100,
+        response_format=StructuredAnswer,
+    )
+
+    assert result.content == StructuredAnswer(answer="ok")
+    assert client.chat.completions.create.await_count == 2
+    first_call = client.chat.completions.create.await_args_list[0].kwargs
+    second_call = client.chat.completions.create.await_args_list[1].kwargs
+    assert first_call["response_format"]["type"] == "json_schema"
+    assert "response_format" not in second_call
+    assert second_call["messages"][0]["role"] == "system"
+    assert "Return only valid JSON matching this schema" in second_call["messages"][0]["content"]
+    assert second_call["messages"][1] == {"role": "user", "content": "Hello"}
 
 
 @pytest.mark.asyncio

@@ -381,14 +381,48 @@ class OpenAIBackend:
         response_format: type[BaseModel],
     ) -> Any:
         structured_params = dict(params)
+        schema = response_format.model_json_schema()
         structured_params["response_format"] = {
             "type": "json_schema",
             "json_schema": {
                 "name": response_format.__name__,
-                "schema": response_format.model_json_schema(),
+                "schema": schema,
             },
         }
-        return await self._client.chat.completions.create(**structured_params)
+        try:
+            return await self._client.chat.completions.create(**structured_params)
+        except BadRequestError:
+            # Some OpenAI-compatible local servers (notably llama.cpp with complex
+            # Pydantic schemas) reject json_schema grammar construction with
+            # "Failed to initialize samplers". Fall back to prompt-level JSON
+            # instructions and let _parse_or_repair_structured_content validate or
+            # return an empty PromptRepresentation rather than poisoning the
+            # deriver queue with permanent 400 retries.
+            fallback_params = dict(params)
+            fallback_params.pop("response_format", None)
+            fallback_messages = list(fallback_params.get("messages") or [])
+            instruction_message = {
+                "role": "system",
+                "content": (
+                    "Return only valid JSON matching this schema. Do not wrap "
+                    "it in markdown and do not include explanatory text.\n"
+                    + json.dumps(schema)
+                ),
+            }
+            # Qwen/Gemma Jinja templates require all system text at the beginning.
+            # Prepend the instruction if there is no leading system message;
+            # otherwise merge it into the existing first system message.
+            if fallback_messages and fallback_messages[0].get("role") == "system":
+                fallback_messages[0] = {
+                    **fallback_messages[0],
+                    "content": instruction_message["content"]
+                    + "\n\n"
+                    + str(fallback_messages[0].get("content", "")),
+                }
+            else:
+                fallback_messages.insert(0, instruction_message)
+            fallback_params["messages"] = fallback_messages
+            return await self._client.chat.completions.create(**fallback_params)
 
     @staticmethod
     def _parse_or_repair_structured_content(
